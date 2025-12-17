@@ -37,115 +37,89 @@ const FIELD_LABELS: Record<string, string> = {
     beta: "Beta",
 };
 
+// Delay helper
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Process a single ticker with retry logic
+async function fetchTickerData(
+    yf: InstanceType<typeof YahooFinance>,
+    ticker: string,
+    selectedFields: string[],
+    retries = 2
+): Promise<Record<string, any>> {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const results: any = await yf.quoteSummary(ticker.trim(), {
+                modules: ['defaultKeyStatistics', 'summaryDetail']
+            });
+
+            const stats = results.defaultKeyStatistics || {};
+            const summary = results.summaryDetail || {};
+            const combined = { ...stats, ...summary };
+
+            const fetchedFields: Record<string, any> = {};
+            selectedFields.forEach(field => {
+                const label = FIELD_LABELS[field] || field;
+                fetchedFields[label] = combined[field] ?? "N/A";
+            });
+
+            return fetchedFields;
+        } catch (error: any) {
+            if (attempt < retries) {
+                await delay((attempt + 1) * 500);
+                continue;
+            }
+            console.error(`Error fetching for ${ticker}:`, error.message);
+
+            const errorFields: Record<string, string> = {};
+            selectedFields.forEach(field => {
+                errorFields[FIELD_LABELS[field] || field] = "Error";
+            });
+            return errorFields;
+        }
+    }
+    return {};
+}
+
 export async function POST(req: NextRequest) {
     try {
-        const formData = await req.formData();
-        const file = formData.get("file") as File;
-        const fieldsJson = formData.get("fields") as string;
+        const body = await req.json();
+        const { tickers, fields } = body;
 
-        if (!file) {
-            return NextResponse.json({ error: "No file uploaded" }, { status: 400 });
+        if (!tickers || !Array.isArray(tickers) || tickers.length === 0) {
+            return NextResponse.json({ error: "No tickers provided" }, { status: 400 });
         }
 
-        // Parse selected fields (default to the original 3 if not provided)
-        let selectedFields = ["floatShares", "sharesOutstanding", "impliedSharesOutstanding"];
-        try {
-            if (fieldsJson) {
-                selectedFields = JSON.parse(fieldsJson);
-            }
-        } catch (e) {
-            console.warn("Could not parse fields, using defaults");
-        }
+        // Parse selected fields
+        let selectedFields = fields || ["floatShares", "sharesOutstanding", "impliedSharesOutstanding"];
 
-        const arrayBuffer = await file.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
-        const workbook = xlsx.read(buffer, { type: "buffer" });
-
-        if (workbook.SheetNames.length === 0) {
-            return NextResponse.json({ error: "Excel file is empty" }, { status: 400 });
-        }
-
-        const sheetName = workbook.SheetNames[0];
-        const sheet = workbook.Sheets[sheetName];
-
-        let data: any[] = xlsx.utils.sheet_to_json(sheet);
-
-        if (data.length === 0) {
-            return NextResponse.json({ error: "Sheet contains no data" }, { status: 400 });
-        }
-
-        const keys = Object.keys(data[0]);
-        let tickerKey = keys.find(k => /symbol|ticker|stock|code/i.test(k));
-
-        if (!tickerKey) {
-            tickerKey = keys[0];
-        }
-
-        console.log(`Using column '${tickerKey}' as ticker source.`);
-        console.log(`Fetching fields: ${selectedFields.join(", ")}`);
+        console.log(`Processing ${tickers.length} tickers`);
 
         const yf = getYahooFinance();
 
-        const updatedData = await Promise.all(
-            data.map(async (row) => {
-                const ticker = row[tickerKey!];
-                if (!ticker || typeof ticker !== 'string') {
-                    const errorFields: Record<string, string> = {};
-                    selectedFields.forEach(field => {
-                        errorFields[FIELD_LABELS[field] || field] = "N/A";
-                    });
-                    return {
-                        ...row,
-                        ...errorFields,
-                        "Error": "Invalid Ticker"
-                    };
-                }
+        // Process tickers sequentially with small delays
+        const results = [];
+        for (let i = 0; i < tickers.length; i++) {
+            const ticker = tickers[i];
 
-                try {
-                    const results: any = await yf.quoteSummary(ticker.trim(), {
-                        modules: ['defaultKeyStatistics', 'summaryDetail']
-                    });
+            if (!ticker || typeof ticker !== 'string' || ticker.trim() === '') {
+                const errorFields: Record<string, string> = {};
+                selectedFields.forEach((field: string) => {
+                    errorFields[FIELD_LABELS[field] || field] = "N/A";
+                });
+                results.push({ ticker, data: errorFields, error: "Invalid Ticker" });
+            } else {
+                const data = await fetchTickerData(yf, ticker, selectedFields);
+                results.push({ ticker, data });
+            }
 
-                    const stats = results.defaultKeyStatistics || {};
-                    const summary = results.summaryDetail || {};
-                    const combined = { ...stats, ...summary };
+            // Small delay between requests
+            if (i < tickers.length - 1) {
+                await delay(150);
+            }
+        }
 
-                    const fetchedFields: Record<string, any> = {};
-                    selectedFields.forEach(field => {
-                        const label = FIELD_LABELS[field] || field;
-                        fetchedFields[label] = combined[field] ?? "N/A";
-                    });
-
-                    return {
-                        ...row,
-                        ...fetchedFields
-                    };
-                } catch (error) {
-                    console.error(`Error fetching for ${ticker}:`, error);
-                    const errorFields: Record<string, string> = {};
-                    selectedFields.forEach(field => {
-                        errorFields[FIELD_LABELS[field] || field] = "Error";
-                    });
-                    return {
-                        ...row,
-                        ...errorFields
-                    };
-                }
-            })
-        );
-
-        const newSheet = xlsx.utils.json_to_sheet(updatedData);
-        const newWorkbook = xlsx.utils.book_new();
-        xlsx.utils.book_append_sheet(newWorkbook, newSheet, sheetName);
-
-        const outBuffer = xlsx.write(newWorkbook, { type: "buffer", bookType: "xlsx" });
-
-        return new NextResponse(outBuffer, {
-            headers: {
-                "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "Content-Disposition": `attachment; filename="updated_${file.name}"`,
-            },
-        });
+        return NextResponse.json({ results });
 
     } catch (error) {
         console.error("Processing error:", error);

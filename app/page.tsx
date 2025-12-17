@@ -32,6 +32,13 @@ const AVAILABLE_FIELDS = [
   { id: "beta", label: "Beta", default: false },
 ];
 
+// Field ID to label mapping
+const FIELD_LABELS: Record<string, string> = {};
+AVAILABLE_FIELDS.forEach(f => { FIELD_LABELS[f.id] = f.label; });
+
+// Chunk size for processing (small enough to stay under 60s timeout)
+const CHUNK_SIZE = 25;
+
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -42,6 +49,7 @@ export default function Home() {
     AVAILABLE_FIELDS.filter(f => f.default).map(f => f.id)
   );
   const [showFieldSelector, setShowFieldSelector] = useState(false);
+  const [progress, setProgress] = useState({ current: 0, total: 0 });
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -49,6 +57,7 @@ export default function Home() {
       setError(null);
       setResults(null);
       setDownloadUrl(null);
+      setProgress({ current: 0, total: 0 });
     }
   };
 
@@ -66,33 +75,90 @@ export default function Home() {
     setIsProcessing(true);
     setError(null);
     setResults(null);
-
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("fields", JSON.stringify(selectedFields));
+    setDownloadUrl(null);
 
     try {
-      const response = await fetch("/api/process", {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || "Failed to process file");
-      }
-
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      setDownloadUrl(url);
-
-      const arrayBuffer = await blob.arrayBuffer();
+      // Read the Excel file
+      const arrayBuffer = await file.arrayBuffer();
       const XLSX = await import("xlsx");
       const workbook = XLSX.read(arrayBuffer, { type: "array" });
       const sheetName = workbook.SheetNames[0];
       const sheet = workbook.Sheets[sheetName];
       const data: StockRow[] = XLSX.utils.sheet_to_json(sheet);
-      setResults(data);
+
+      if (data.length === 0) {
+        throw new Error("Excel file contains no data");
+      }
+
+      // Find ticker column
+      const keys = Object.keys(data[0]);
+      let tickerKey = keys.find(k => /symbol|ticker|stock|code/i.test(k)) || keys[0];
+
+      // Extract all tickers
+      const allTickers = data.map(row => String(row[tickerKey] || ""));
+      setProgress({ current: 0, total: allTickers.length });
+
+      // Process in chunks
+      const allResults: { ticker: string; data: Record<string, any>; error?: string }[] = [];
+
+      for (let i = 0; i < allTickers.length; i += CHUNK_SIZE) {
+        const chunk = allTickers.slice(i, i + CHUNK_SIZE);
+
+        try {
+          const response = await fetch("/api/process", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              tickers: chunk,
+              fields: selectedFields
+            }),
+          });
+
+          if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.error || "Failed to process chunk");
+          }
+
+          const { results: chunkResults } = await response.json();
+          allResults.push(...chunkResults);
+        } catch (chunkError: any) {
+          // If a chunk fails, add error results for those tickers
+          chunk.forEach(ticker => {
+            const errorFields: Record<string, string> = {};
+            selectedFields.forEach(field => {
+              errorFields[FIELD_LABELS[field] || field] = "Error";
+            });
+            allResults.push({ ticker, data: errorFields, error: chunkError.message });
+          });
+        }
+
+        setProgress({ current: Math.min(i + CHUNK_SIZE, allTickers.length), total: allTickers.length });
+
+        // Small delay between chunks to be safe
+        if (i + CHUNK_SIZE < allTickers.length) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+
+      // Merge results back into original data
+      const updatedData = data.map((row, index) => {
+        const result = allResults[index];
+        return {
+          ...row,
+          ...result?.data
+        };
+      });
+
+      setResults(updatedData);
+
+      // Create downloadable Excel
+      const newSheet = XLSX.utils.json_to_sheet(updatedData);
+      const newWorkbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(newWorkbook, newSheet, sheetName);
+      const outBuffer = XLSX.write(newWorkbook, { type: "array", bookType: "xlsx" });
+      const blob = new Blob([outBuffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const url = window.URL.createObjectURL(blob);
+      setDownloadUrl(url);
 
     } catch (err: any) {
       setError(err.message || "An unexpected error occurred");
@@ -121,6 +187,8 @@ export default function Home() {
     }
     return String(val);
   };
+
+  const progressPercent = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 flex flex-col items-center p-4 md:p-8">
@@ -153,6 +221,7 @@ export default function Home() {
           <div className="p-6 md:p-8">
             <p className="text-slate-400 text-center mb-6">
               Upload your Excel file and select the data points you want to fetch from Yahoo Finance.
+              <span className="block text-sm mt-1 text-slate-500">Supports large files with 2000+ stocks!</span>
             </p>
 
             {/* Upload Area */}
@@ -248,6 +317,22 @@ export default function Home() {
               </div>
             )}
 
+            {/* Progress Bar */}
+            {isProcessing && progress.total > 0 && (
+              <div className="mt-4">
+                <div className="flex justify-between text-sm text-slate-400 mb-2">
+                  <span>Processing stocks...</span>
+                  <span>{progress.current} / {progress.total} ({progressPercent}%)</span>
+                </div>
+                <div className="h-3 bg-slate-800 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-purple-500 to-blue-500 transition-all duration-300 ease-out"
+                    style={{ width: `${progressPercent}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
             {/* Action Buttons */}
             <div className="mt-6 flex gap-4">
               <button
@@ -264,7 +349,7 @@ export default function Home() {
                 {isProcessing ? (
                   <>
                     <Loader2 className="w-6 h-6 animate-spin" />
-                    Processing...
+                    Processing... {progressPercent}%
                   </>
                 ) : (
                   <>
@@ -295,10 +380,10 @@ export default function Home() {
                   Fetched Data ({results.length} stocks)
                 </h2>
               </div>
-              <div className="overflow-x-auto">
+              <div className="overflow-x-auto max-h-96">
                 <table className="w-full text-sm">
-                  <thead>
-                    <tr className="bg-slate-800/80">
+                  <thead className="sticky top-0">
+                    <tr className="bg-slate-800">
                       {Object.keys(results[0]).map((key) => (
                         <th key={key} className="px-4 py-3 text-left text-slate-300 font-medium whitespace-nowrap">
                           {key}
@@ -307,7 +392,7 @@ export default function Home() {
                     </tr>
                   </thead>
                   <tbody>
-                    {results.map((row, i) => (
+                    {results.slice(0, 100).map((row, i) => (
                       <tr
                         key={i}
                         className={`
@@ -335,6 +420,11 @@ export default function Home() {
                     ))}
                   </tbody>
                 </table>
+                {results.length > 100 && (
+                  <div className="p-4 text-center text-slate-400 text-sm bg-slate-800/50">
+                    Showing first 100 rows. Download the Excel file to see all {results.length} rows.
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -342,7 +432,7 @@ export default function Home() {
 
         {/* Footer */}
         <p className="text-center text-slate-500 text-sm mt-6">
-          Data sourced from Yahoo Finance • Updates in real-time
+          Data sourced from Yahoo Finance • Processes in batches for large files
         </p>
       </div>
     </main>
